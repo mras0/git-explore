@@ -63,7 +63,7 @@ std::vector<std::string> all_files_in_dir(const std::string& dir)
 }
 
 enum class object_type : uint8_t {
-//	none = 0,
+	none = 0,
 	commit = 1,
 	tree = 2,
 	blob = 3,
@@ -75,6 +75,7 @@ enum class object_type : uint8_t {
 const char* object_type_string(object_type type)
 {
     switch (type) {
+    case object_type::none:      return "none";
     case object_type::commit:    return "commit";
     case object_type::tree:      return "tree";
     case object_type::blob:      return "blob";
@@ -89,6 +90,7 @@ std::istream& operator>>(std::istream& is, object_type& type) {
     std::string s;
     if (!(is >> s)) return is;
 #define CHECK_OBJTYPE(t) do { if (s == object_type_string(object_type::t)) { type = object_type::t; return is; } } while (0)
+    CHECK_OBJTYPE(none);
     CHECK_OBJTYPE(commit);
     CHECK_OBJTYPE(tree);
     CHECK_OBJTYPE(blob);
@@ -105,7 +107,7 @@ std::ostream& operator<<(std::ostream& os, object_type type) {
 
 class object {
 public:
-    object(object_type type, const std::string& data) : type_(type), data_(data) {}
+    object(object_type type=object_type::none, const std::string& data="") : type_(type), data_(data) {}
     virtual ~object() {}
 
     object_type type() const {
@@ -162,7 +164,62 @@ uint32_t read_be_u32(std::istream& is)
     return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | ((uint32_t)bytes[3]);
 }
 
-object read_object_from_pack_file(const std::string& pack_filename, const sha1_digest& hash, uint64_t offset)
+size_t read_delta_size(std::istream& is)
+{
+    size_t size = 0;
+    uint8_t b = 0x80;
+    for (unsigned shift = 0; b & 0x80; shift += 7) {
+        assert(shift < sizeof(size)*8);
+        b = read_u8(is);
+        size |= size_t(b & 0x7f) << shift;
+    }
+    return size;
+}
+
+std::string apply_delta(const std::string& src, const std::string& delta) {
+    std::istringstream d(delta);
+    const size_t expected_src_size = read_delta_size(d);
+    if (expected_src_size != src.size()) {
+        throw std::runtime_error("Delta source size " + std::to_string(src.size()) + " != expected " + std::to_string(expected_src_size));
+    }
+    const size_t dst_size = read_delta_size(d);
+    std::string res;
+    while (d.rdbuf()->in_avail()) {
+        const uint8_t b = read_u8(d);
+        if (b == 0) {
+            assert(false);
+            throw std::runtime_error("Zero byte in delta");
+        } else if (b & 0x80) {
+            uint32_t offset = 0, size = 0;
+            if (b & 0x01) offset |= read_u8(d);
+            if (b & 0x02) offset |= ((uint32_t)read_u8(d))<<8;
+            if (b & 0x04) offset |= ((uint32_t)read_u8(d))<<16;
+            if (b & 0x08) offset |= ((uint32_t)read_u8(d))<<24;
+            if (b & 0x10) size |= read_u8(d);
+            if (b & 0x20) size |= ((uint32_t)read_u8(d))<<8;
+            if (b & 0x40) size |= ((uint32_t)read_u8(d))<<16;
+            if (!size) size = 1<<16;
+            if (offset >= src.size() || (uint64_t)offset + size > src.size()) {
+                std::ostringstream msg;
+                msg << "offset " << offset << " size " << size << " out of range for src size " << src.size();
+                throw std::runtime_error(msg.str());
+            }
+            res += src.substr(offset, size);
+        } else {
+            std::string tmp(b, '\0');
+            if(!d.read(&tmp[0], b)) {
+                throw std::runtime_error("Error applying delta");
+            }
+            res += tmp;
+        }
+    }
+    assert(res.size() == dst_size);
+    return res;
+}
+
+object read_object(const std::string& base_dir, const sha1_digest& hash);
+
+object read_object_from_pack_file(const std::string& base_dir, const std::string& pack_filename, uint64_t offset)
 {
     std::ifstream pack(pack_filename, std::ifstream::binary);
     if (!pack || !pack.is_open()) {
@@ -186,9 +243,29 @@ object read_object_from_pack_file(const std::string& pack_filename, const sha1_d
     for (unsigned shift = 4; b & 0x80; shift += 7) {
         assert(shift < sizeof(size)*8);
         b = read_u8(pack);
-        size |= (b & 0x7f) << shift;
+        size |= size_t(b & 0x7f) << shift;
     }
-    if (type != object_type::commit && type != object_type::tree && type != object_type::blob) {
+    //std::cout << "Reading pack file entry of type " << type << " size " << size << std::endl;
+    object delta_obj{};
+    if (type == object_type::ofs_delta) {
+        b = read_u8(pack);
+        size_t offset_delta = b & 0x7f;
+        while (b & 0x80) {
+            ++offset_delta;
+            offset_delta <<= 7;
+            b = read_u8(pack);
+            offset_delta |= b & 0x7f;
+        }
+        if (!offset_delta) {
+            throw std::runtime_error("Invalid offset delta in " + pack_filename);
+        }
+        //std::cout << "offset_delta = " << offset_delta << std::endl;
+        delta_obj = read_object_from_pack_file(base_dir, pack_filename, offset - offset_delta);
+    } else if (type == object_type::ref_delta) {
+        auto hash = sha1_digest::read(pack);
+        //std::cout << "hash = " << hash << std::endl;
+        delta_obj = read_object(base_dir, hash);
+    } else if (type != object_type::commit && type != object_type::tree && type != object_type::blob) {
         std::ostringstream msg;
         msg << "Unsupported object type " << type << " in " << __func__;
         throw std::runtime_error(msg.str());
@@ -201,14 +278,11 @@ object read_object_from_pack_file(const std::string& pack_filename, const sha1_d
         msg << "Invalid uncompressed size " << s.size() << " expected " << size;
         throw std::runtime_error(msg.str());
     }
-    std::ostringstream digest_buf;
-    digest_buf << type << ' ' << s.size() << '\0' << s;
-    const auto d = sha1_digest::calculate(digest_buf.str());
-    if (hash != d) {
-        std::ostringstream msg;
-        msg << "Digest mismatch for object " << hash << " - calculated digest: " << d << std::endl;
-        throw std::runtime_error(msg.str());
+    if (delta_obj.type() != object_type::none) {
+        assert(type == object_type::ofs_delta || type == object_type::ref_delta);
+        return object{delta_obj.type(), apply_delta(delta_obj.str(), s)};
     }
+
     return object{type, s};
 }
 
@@ -266,7 +340,16 @@ object read_object_from_pack(const std::string& base_dir, const sha1_digest& has
                     throw std::runtime_error("Offset in pack file with MSB set not supported (" + std::to_string(offset) + ")");
                 }
 
-                return read_object_from_pack_file(pack_filename, hash, offset);
+                auto obj = read_object_from_pack_file(base_dir, pack_filename, offset);
+                std::ostringstream digest_buf;
+                digest_buf << obj.type() << ' ' << obj.str().size() << '\0' << obj.str();
+                const auto d = sha1_digest::calculate(digest_buf.str());
+                if (hash != d) {
+                    std::ostringstream msg;
+                    msg << "Digest mismatch for object " << hash << " - calculated digest: " << d << std::endl;
+                    throw std::runtime_error(msg.str());
+                }
+                return obj;
             }
         }
     }
@@ -391,9 +474,6 @@ commit parse_commit(const object& o)
             throw std::runtime_error("Invalid line \"" + line + "\" encounted in commit");
         }
         auto attr = line.substr(0, sp_pos);
-        if (c.find_attribute(attr)) {
-            throw std::runtime_error("Duplicate attribute \"" + attr + "\" found in commit");
-        }
         auto val = line.substr(sp_pos+1);
         c.attributes.emplace_back(std::move(attr), std::move(val));
     }
@@ -448,6 +528,24 @@ void print_tree(std::ostream& os, const std::string& base_dir, const tree& t, co
     }
 }
 
+using file_list = std::vector<std::pair<std::string, std::string>>;
+
+file_list all_files_in_tree(const std::string& base_dir, const tree& t, const std::string& path="") {
+    file_list res;
+    for (const auto& e : t.entries) {
+        auto obj = read_object(base_dir, e.digest);
+        if (obj.type() == object_type::tree) {
+            auto subdir = all_files_in_tree(base_dir, parse_tree(obj), path+e.name+"/");
+            res.insert(res.end(), subdir.begin(), subdir.end());
+        } else if (obj.type() == object_type::blob) {
+            res.push_back(make_pair(path+e.name, obj.str()));
+        } else {
+            assert(false);
+        }
+    }
+    return res;
+}
+
 int main(int argc, const char* argv[])
 {
     std::string base_dir = argc >= 2 ? argv[1] : "";
@@ -472,4 +570,10 @@ int main(int argc, const char* argv[])
     std::cout << head.attribute("tree") << std::endl;
     auto t = parse_tree(read_object(base_dir, sha1_digest(head.attribute("tree"))));
     print_tree(std::cout, base_dir, t);
+    for (const auto& f : all_files_in_tree(base_dir, t)) {
+        std::cout << std::string(72,'*') << std::endl;
+        std::cout << f.first << std::endl;
+        std::cout << std::string(72,'*') << std::endl;
+        std::cout << f.second << std::endl;
+    }
 }
