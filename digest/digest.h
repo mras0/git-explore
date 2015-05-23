@@ -3,10 +3,12 @@
 
 #include <stddef.h>
 #include <iosfwd>
+#include <string>
 
 class sha1_digest {
 public:
     sha1_digest() {}
+    sha1_digest(const std::string& s);
 
     static sha1_digest calculate(const void* bytes, size_t count);
     template<typename C>
@@ -15,10 +17,17 @@ public:
         return calculate(c.data(), c.size());
     }
 
+    std::string str() const;
+
     friend bool operator==(const sha1_digest& lhs, const sha1_digest& rhs);
-    friend std::ostream& operator<<(std::ostream& os, const sha1_digest& d);
 private:
     unsigned char digest_[20];
 };
+
+inline bool operator!=(const sha1_digest& lhs, const sha1_digest& rhs) {
+    return !(lhs == rhs);
+}
+
+std::ostream& operator<<(std::ostream& os, const sha1_digest& d);
 
 #endif
