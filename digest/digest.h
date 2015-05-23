@@ -2,6 +2,7 @@
 #define SHA1_DIGEST_H
 
 #include <stddef.h>
+#include <assert.h>
 #include <iosfwd>
 #include <string>
 
@@ -20,10 +21,20 @@ public:
 
     std::string str() const;
 
-    friend bool operator==(const sha1_digest& lhs, const sha1_digest& rhs);
+    unsigned char operator[](int index) const {
+        assert(index >= 0 && index < (int)sizeof(digest_));
+        return digest_[index];
+    }
+
+    int compare(const sha1_digest& rhs) const;
+
 private:
     unsigned char digest_[20];
 };
+
+inline bool operator==(const sha1_digest& lhs, const sha1_digest& rhs) {
+    return lhs.compare(rhs) == 0;
+}
 
 inline bool operator!=(const sha1_digest& lhs, const sha1_digest& rhs) {
     return !(lhs == rhs);

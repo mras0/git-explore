@@ -6,6 +6,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <memory>
+#include <algorithm>
 #include <digest/digest.h>
 #include <compress/compress.h>
 
@@ -30,31 +31,71 @@ void hexdump(std::ostream& os, const void* src, size_t len)
     }
 }
 
-enum class object_type {
-    blob, commit, tree
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <string.h>
+#include <vector>
+
+std::vector<std::string> all_files_in_dir(const std::string& dir)
+{
+    std::unique_ptr<DIR, decltype(&::closedir)> dir_(opendir(dir.c_str()), &::closedir);
+    if (!dir_) {
+        throw std::runtime_error("opendir('" + dir + "') failed: " + strerror(errno));
+    }
+
+    std::vector<std::string> files;
+    while (dirent* de = readdir(dir_.get())) {
+        if (de->d_name[0] == '.') {
+            continue;
+        }
+        const auto p = dir + "/" + de->d_name;
+        struct stat st;
+        if (stat(p.c_str(), &st) < 0) {
+            throw std::runtime_error("stat('" + p + "') failed: " + strerror(errno));
+        }
+        if (!S_ISREG(st.st_mode)) {
+            continue;
+        }
+        files.push_back(de->d_name);
+    }
+    return files;
+}
+
+enum class object_type : uint8_t {
+//	none = 0,
+	commit = 1,
+	tree = 2,
+	blob = 3,
+	tag = 4,
+	ofs_delta = 6,
+	ref_delta = 7,
 };
 
 const char* object_type_string(object_type type)
 {
     switch (type) {
-    case object_type::blob:   return "blob";
-    case object_type::commit: return "commit";
-    case object_type::tree:   return "tree";
+    case object_type::commit:    return "commit";
+    case object_type::tree:      return "tree";
+    case object_type::blob:      return "blob";
+    case object_type::tag:       return "tag";
+    case object_type::ofs_delta: return "ofs_delta";
+    case object_type::ref_delta: return "ref_delta";
     }
-    assert(false);
     throw std::runtime_error("Invalid object type " + std::to_string((unsigned)type));
 }
 
 std::istream& operator>>(std::istream& is, object_type& type) {
     std::string s;
     if (!(is >> s)) return is;
-    for (unsigned i = 0; i <= static_cast<unsigned>(object_type::tree); ++i) {
-        const auto ot = static_cast<object_type>(i);
-        if (s == object_type_string(ot)) {
-            type = ot;
-            return is;
-        }
-    }
+#define CHECK_OBJTYPE(t) do { if (s == object_type_string(object_type::t)) { type = object_type::t; return is; } } while (0)
+    CHECK_OBJTYPE(commit);
+    CHECK_OBJTYPE(tree);
+    CHECK_OBJTYPE(blob);
+    CHECK_OBJTYPE(tag);
+    CHECK_OBJTYPE(ofs_delta);
+    CHECK_OBJTYPE(ref_delta);
+#undef CHECK_OBJTYPE
     throw std::runtime_error("Unknown object type \"" + s + "\"");
 }
 
@@ -83,13 +124,165 @@ private:
     std::string data_;
 };
 
+bool has_extension(const std::string& p, const std::string& ext)
+{
+    if (p.size() <= ext.size()) return false;
+    if (p[p.size()-ext.size()-1] != '.') return false;
+    return p.compare(p.size()-ext.size(), ext.size(), ext) == 0;
+}
+
+std::vector<std::string> all_packs(const std::string& pack_dir)
+{
+    std::vector<std::string> res;
+    const auto files = all_files_in_dir(pack_dir);
+    for (const auto& p : files) {
+        if (has_extension(p, "idx")) {
+            auto n = p.substr(0, p.size()-4);
+            res.push_back(n);
+        }
+    }
+    return res;
+}
+
+uint8_t read_u8(std::istream& is)
+{
+    unsigned char b;
+    if (!is.read((char*)&b, 1)) {
+        throw std::runtime_error("Error while reading");
+    }
+    return b;
+}
+
+uint32_t read_be_u32(std::istream& is)
+{
+    unsigned char bytes[4];
+    if (!is.read((char*)bytes, sizeof(bytes))) {
+        throw std::runtime_error("Error while reading");
+    }
+    return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | ((uint32_t)bytes[3]);
+}
+
+object read_object_from_pack_file(const std::string& pack_filename, const sha1_digest& hash, uint64_t offset)
+{
+    std::ifstream pack(pack_filename, std::ifstream::binary);
+    if (!pack || !pack.is_open()) {
+        throw std::runtime_error("Error opening " + pack_filename);
+    }
+
+    const auto sig = read_be_u32(pack);
+    if (sig != 0x5041434b) { // PACK
+        throw std::runtime_error(pack_filename + " has invalid PACK signature " + std::to_string(sig));
+    }
+    const auto ver = read_be_u32(pack);
+    if (ver != 2) {
+        throw std::runtime_error(pack_filename + " has invalid PACK version " + std::to_string(ver));
+    }
+    //const auto numobjs = read_be_u32(pack);
+
+    pack.seekg(offset);
+    uint8_t b = read_u8(pack);
+    const auto type = static_cast<object_type>((b >> 4) & 7);
+    size_t size = b&0xf;
+    for (unsigned shift = 4; b & 0x80; shift += 7) {
+        assert(shift < sizeof(size)*8);
+        b = read_u8(pack);
+        size |= (b & 0x7f) << shift;
+    }
+    if (type != object_type::commit && type != object_type::tree && type != object_type::blob) {
+        std::ostringstream msg;
+        msg << "Unsupported object type " << type << " in " << __func__;
+        throw std::runtime_error(msg.str());
+    }
+    std::ostringstream oss;
+    zlib_decompress(oss, pack);
+    auto s = oss.str();
+    if (s.size() != size) {
+        std::ostringstream msg;
+        msg << "Invalid uncompressed size " << s.size() << " expected " << size;
+        throw std::runtime_error(msg.str());
+    }
+    std::ostringstream digest_buf;
+    digest_buf << type << ' ' << s.size() << '\0' << s;
+    const auto d = sha1_digest::calculate(digest_buf.str());
+    if (hash != d) {
+        std::ostringstream msg;
+        msg << "Digest mismatch for object " << hash << " - calculated digest: " << d << std::endl;
+        throw std::runtime_error(msg.str());
+    }
+    return object{type, s};
+}
+
+object read_object_from_pack(const std::string& base_dir, const sha1_digest& hash)
+{
+    const auto pack_dir = base_dir + "objects/pack/";
+    for (const auto& p : all_packs(pack_dir)) {
+        const auto idx_filename = pack_dir + p + ".idx";
+        const auto pack_filename = pack_dir + p + ".pack";
+        std::ifstream index(idx_filename, std::ifstream::binary);
+        if (!index || !index.is_open()) {
+            throw std::runtime_error("Error opening " + idx_filename);
+        }
+
+        uint32_t version = 1;
+        uint32_t fan_table[256];
+        auto magic = read_be_u32(index);
+        if (magic == 0xff744f63) {
+            version = read_be_u32(index);
+        } else {
+            fan_table[0] = magic;
+        }
+        for (int i = version == 1 ? 1 : 0; i < 256; ++i) {
+            fan_table[i] = read_be_u32(index);
+        }
+        if (version != 2) {
+            throw std::runtime_error("Invalid index file version " + std::to_string(version));
+        }
+        const auto sorted_name_index = 8+256*4;
+        assert(index.tellg() == sorted_name_index);
+
+        uint32_t low = 0;
+        if (hash[0]) low = fan_table[hash[0]-1];
+        uint32_t high = fan_table[hash[0]];
+
+        while (low <= high) {
+            const uint32_t mid = low + (high - low)/2;
+
+            index.seekg(sorted_name_index + 20 * mid);
+            const auto id = sha1_digest::read(index);
+            //std::cout << "Looking for " << hash << " in [" << low << "; " << high << "] ";
+            //std::cout << "mid= " << mid << " id = " << id << std::endl;
+
+            const int c = hash.compare(id);
+            if (c > 0) {
+                low = mid + 1;
+            } else if (c < 0) {
+                high = mid - 1;
+            } else {
+                //std::cout << "Found at index " << mid << std::endl;
+                const auto offset_index = sorted_name_index + fan_table[255] * (20 + 4); // SHA + CRC for each entry
+                index.seekg(offset_index + 4 * mid);
+                const auto offset = read_be_u32(index);
+                if (offset & 0x80000000) {
+                    throw std::runtime_error("Offset in pack file with MSB set not supported (" + std::to_string(offset) + ")");
+                }
+
+                return read_object_from_pack_file(pack_filename, hash, offset);
+            }
+        }
+    }
+    std::ostringstream msg;
+    msg << hash << " not found in any pack file";
+    throw std::runtime_error(msg.str());
+}
+
 object read_object(const std::string& base_dir, const sha1_digest& hash)
 {
     std::ostringstream oss;
     const auto filename = base_dir + "objects/" + hash.str().insert(2, "/");
     std::ifstream in(filename, std::ifstream::binary);
     if (!in || !in.is_open()) {
-        throw std::runtime_error("Error opening " + filename);
+        // try pack directory
+        return read_object_from_pack(base_dir, hash);
     }
     zlib_decompress(oss, in);
     const auto s = oss.str();
@@ -260,6 +453,9 @@ int main(int argc, const char* argv[])
     std::string base_dir = argc >= 2 ? argv[1] : "";
     if (!base_dir.empty() && base_dir.back() != '/') base_dir += "/";
     base_dir += ".git/";
+
+//    print_tree(std::cout, base_dir, parse_tree(read_object(base_dir, sha1_digest("799bcf044c512ad8d61cc88b2cb5bada0b9d92d1"))));
+
     auto head = parse_commit(read_head(base_dir));
     std::cout << head << std::endl;
     if (auto p = head.find_attribute("parent")) {

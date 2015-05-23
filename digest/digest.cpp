@@ -60,9 +60,9 @@ sha1_digest sha1_digest::read(std::istream& is)
     return res;
 }
 
-bool operator==(const sha1_digest& lhs, const sha1_digest& rhs)
+int sha1_digest::compare(const sha1_digest& rhs) const
 {
-    return memcmp(lhs.digest_, rhs.digest_, sizeof(lhs.digest_)) == 0;
+    return memcmp(digest_, rhs.digest_, sizeof(digest_));
 }
 
 std::string sha1_digest::str() const
