@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <cassert>
 #include <sha/sha.h>
+#include <compress/compress.h>
 
 void sha1(uint8_t digest[SHA1HashSize], const void* bytes, unsigned count)
 {
@@ -48,4 +49,13 @@ void test_sha1()
 int main()
 {
     test_sha1();
+    std::ifstream in("../.git/objects/37/4ce9d0f408307ac48ec0866cc6dcae01512a5e", std::ifstream::binary);
+    assert(in && in.is_open());
+    std::ostringstream oss;
+    zlib_decompress(oss, in);
+    const auto s = oss.str();
+    std::cout << s;
+    uint8_t digest[SHA1HashSize];
+    sha1(digest, s.data(), s.size());
+    std::cout << hex(digest) << std::endl;
 }
