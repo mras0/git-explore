@@ -41,7 +41,7 @@ std::vector<std::string> all_files_in_dir(const std::string& dir)
 {
     std::unique_ptr<DIR, decltype(&::closedir)> dir_(opendir(dir.c_str()), &::closedir);
     if (!dir_) {
-        throw std::runtime_error("opendir('" + dir + "') failed: " + strerror(errno));
+        return {};
     }
 
     std::vector<std::string> files;
@@ -329,7 +329,9 @@ object read_object_from_pack(const std::string& base_dir, const sha1_digest& has
             const int c = hash.compare(id);
             if (c > 0) {
                 low = mid + 1;
+                if (!low) break;
             } else if (c < 0) {
+                if (!mid) break;
                 high = mid - 1;
             } else {
                 //std::cout << "Found at index " << mid << std::endl;
@@ -551,8 +553,6 @@ int main(int argc, const char* argv[])
     std::string base_dir = argc >= 2 ? argv[1] : "";
     if (!base_dir.empty() && base_dir.back() != '/') base_dir += "/";
     base_dir += ".git/";
-
-//    print_tree(std::cout, base_dir, parse_tree(read_object(base_dir, sha1_digest("799bcf044c512ad8d61cc88b2cb5bada0b9d92d1"))));
 
     auto head = parse_commit(read_head(base_dir));
     std::cout << head << std::endl;
