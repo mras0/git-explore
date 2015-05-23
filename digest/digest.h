@@ -16,6 +16,7 @@ public:
         static_assert(sizeof(*c.data()) == 1, "");
         return calculate(c.data(), c.size());
     }
+    static sha1_digest read(std::istream& is);
 
     std::string str() const;
 

@@ -1,5 +1,6 @@
 #include "digest.h"
 #include "sha.h"
+#include <istream>
 #include <ostream>
 #include <stdexcept>
 #include <string.h>
@@ -47,6 +48,15 @@ sha1_digest sha1_digest::calculate(const void* bytes, size_t count)
     SHA1Reset(&context);
     SHA1Input(&context, reinterpret_cast<const uint8_t*>(bytes), count);
     SHA1Result(&context, res.digest_);
+    return res;
+}
+
+sha1_digest sha1_digest::read(std::istream& is)
+{
+    sha1_digest res;
+    if (!is.read((char*)&res.digest_, sizeof(res.digest_))) {
+        throw std::runtime_error("Could not read sha1 digest");
+    }
     return res;
 }
 
