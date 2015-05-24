@@ -554,6 +554,19 @@ int main(int argc, const char* argv[])
     if (!base_dir.empty() && base_dir.back() != '/') base_dir += "/";
     base_dir += ".git/";
 
+    const auto tags_dir = base_dir + "refs/tags/";
+    for (const auto& f : all_files_in_dir(tags_dir)) {
+        std::cout << "TAG " << f << std::endl;
+        std::cout << parse_commit(read_object(base_dir, read_line(tags_dir+f))) << std::endl;
+    }
+    std::cout << std::endl << std::endl;
+    const auto heads_dir = base_dir + "refs/heads/";
+    for (const auto& f : all_files_in_dir(heads_dir)) {
+        std::cout << "HEAD " << f << std::endl;
+        std::cout << parse_commit(read_object(base_dir, read_line(heads_dir+f))) << std::endl;
+    }
+    std::cout << std::endl << std::endl;
+
     auto head = parse_commit(read_head(base_dir));
     std::cout << head << std::endl;
     if (auto p = head.find_attribute("parent")) {
